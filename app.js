@@ -1,4 +1,4 @@
-// Resolved: play-money prediction markets on NPDI, shared by everyone. The market lives on the server (worker/):
+// Parli Market: play-money prediction markets on NPDI, shared by everyone. The market lives on the server (worker/):
 // this page reads it from /api/state every few seconds and sends trades to /api/trade; you sign in with Google to
 // trade. The maths (market.js) is the same on both sides, so the ticket can preview a trade before it's sent.
 import { EVENT, START_CASH } from './data.js';
@@ -504,7 +504,8 @@ function refresh() {
   updateChips(); updateMarket(); drawChart(); updateTicket();
   renderAccount(); renderPositions(); renderBoard(); renderFeed();
 }
-setInterval(() => { if (!document.hidden && S.ready) renderFeed(); }, 30e3);
+// keep the times fresh while nobody trades: the feed's "2m ago" and the chart's right edge (now)
+setInterval(() => { if (!document.hidden && S.ready) { renderFeed(); drawChart(); } }, 30e3);
 
 /* ---------- start ---------- */
 $('ev-name').textContent = `${EVENT.short} ${EVENT.year}`;

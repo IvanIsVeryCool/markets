@@ -1,4 +1,4 @@
-# Resolved: project notes
+# Parli Market: project notes
 
 Play-money prediction markets on NPDI (the National Parliamentary Debate Invitational), Kalshi-style, shared by
 everyone who signs in with Google.
@@ -38,7 +38,7 @@ steps; the OAuth client's redirect URI is `https://markets.ivancui211.workers.de
 ## Files
 | File | What it does |
 |---|---|
-| `index.html` | The page and all its CSS (light and dark): top bar (the mark and "Resolved"; signed in: Portfolio, Cash and an account menu with Sign out; signed out: "Sign in with Google"), market chips, the market card (icon, head, headline number for Yes/No markets, legend, chart, ranges, contracts), the Positions / Leaderboard / Activity / Rules tabs, the order ticket (a bottom sheet under 920 px). |
+| `index.html` | The page and all its CSS (light and dark): top bar (the mark and "Parli Market"; signed in: Portfolio, Cash and an account menu with Sign out; signed out: "Sign in with Google"), market chips, the market card (icon, head, headline number for Yes/No markets, legend, chart, ranges, contracts), the Positions / Leaderboard / Activity / Rules tabs, the order ticket (a bottom sheet under 920 px). |
 | `app.js` | The page's logic: polling and merging the server's state, the chart (SVG steps; the top three teams at page load keep their colours for the visit and the selected team takes the fourth; crosshair and tooltip), the contracts list, the ticket and sending trades, positions, leaderboard, activity, the account menu. The URL hash picks the market (`#champion`). |
 | `market.js` | Shared by the page and the Worker: the markets built from `data.js` (`M`, `byId`, each with `outs`, `p0`, `sig`) and the LMSR maths (`prices`, `priceOf`, `moved`, `costOf`, `sharesFor`, `worth`, `startQ`). |
 | `worker/index.js` | The Worker (sign-in, `/api/state`, `/api/trade`, everything else to the assets) and the `Market` Durable Object. |

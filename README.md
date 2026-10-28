@@ -1,4 +1,4 @@
-# Resolved
+# Parli Market
 
 Play-money prediction markets on the National Parliamentary Debate Invitational (NPDI): who wins, who's top seed,
 and a few Yes/No questions. One shared market: everyone trades the same prices, and a leaderboard ranks players.
@@ -10,12 +10,12 @@ Live at https://markets.ivancui211.workers.dev (Cloudflare deploys every push to
 Until this is done the site works, but the sign-in button says sign-in isn't set up yet.
 
 1. Go to https://console.cloud.google.com, sign in, and create a project (top bar → project picker → New project),
-   named for example "Resolved".
-2. Open **Google Auth Platform** (search for "OAuth consent screen") → **Get started**: app name "Resolved", your
+   named for example "Parli Market".
+2. Open **Google Auth Platform** (search for "OAuth consent screen") → **Get started**: app name "Parli Market", your
    email as the support email, audience **External**, your email as the contact → Create.
 3. **Audience** → **Publish app** (so anyone can sign in, not only test users). The site only asks for name and
    email, so Google doesn't need to review it.
-4. **Clients** → **Create client** → type **Web application**, name "Resolved". Under **Authorized redirect URIs**
+4. **Clients** → **Create client** → type **Web application**, name "Parli Market". Under **Authorized redirect URIs**
    add exactly `https://markets.ivancui211.workers.dev/auth/callback` → Create. Copy the **Client ID** and
    **Client secret**.
 5. In Cloudflare: Workers & Pages → **markets** → Settings → **Variables and Secrets** → Add, type **Secret**:
