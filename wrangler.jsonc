@@ -1,0 +1,9 @@
+// Cloudflare Workers, static assets only: the repo is the site, served as-is (no build step).
+{
+  "name": "markets",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./",
+    "not_found_handling": "404-page"
+  }
+}

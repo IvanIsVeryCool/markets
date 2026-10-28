@@ -1,0 +1,9 @@
+# files in the repo that are not part of the website
+.git
+.gitignore
+.assetsignore
+README.md
+CLAUDE.md
+wrangler.jsonc
+node_modules
+.wrangler
