@@ -1,9 +1,8 @@
 /* =====================================================================
    THE FIELD AND THE MARKETS: the only part you should need to edit
    ===================================================================== */
-// The tournament. The year follows the school year (NPDI is in the spring), so it moves on by itself.
-const SY = (() => { const d = new Date(); return d.getMonth() >= 6 ? d.getFullYear() : d.getFullYear() - 1; })();
-export const EVENT = { short: 'NPDI', name: 'National Parliamentary Debate Invitational', year: SY + 1 };
+// The tournament.
+export const EVENT = { short: 'NPDI', name: 'National Parliamentary Debate Invitational', year: 2026 };
 
 // The teams going in. `p` is each team's starting chance to win (they're scaled to add up to 100%),
 // `seed` its chance to be top seed after prelims. A sample field (made-up odds) until the real qualifiers are in.
