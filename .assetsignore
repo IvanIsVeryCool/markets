@@ -5,5 +5,7 @@
 README.md
 CLAUDE.md
 wrangler.jsonc
+worker
 node_modules
 .wrangler
+.dev.vars

@@ -1,9 +1,20 @@
-// Cloudflare Workers, static assets only: the repo is the site, served as-is (no build step).
+// Cloudflare Workers: the repo is the static site, served as-is (no build step), with a Worker in front of /auth/
+// (sign in with Google) and /api/ (the shared market, kept in one Durable Object).
 {
   "name": "markets",
+  "main": "worker/index.js",
   "compatibility_date": "2026-09-01",
   "assets": {
     "directory": "./",
-    "not_found_handling": "404-page"
-  }
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "run_worker_first": ["/api/*", "/auth/*"]
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "MARKET", "class_name": "Market" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Market"] }]
+  // secrets, set in the dashboard (Workers & Pages → markets → Settings → Variables and Secrets):
+  //   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET   from the Google Cloud OAuth client (see README)
+  //   ALLOWED_DOMAINS (optional)               e.g. "nuevaschool.org" to let only those emails play
 }

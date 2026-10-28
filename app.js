@@ -1,16 +1,16 @@
-// Resolved: play-money prediction markets on NPDI. Each market is priced by an automated market maker (LMSR: a team's
-// price is its share of exp(q / b) over all teams, so prices always add up to $1 and every trade moves them),
-// with a few simulated traders nudging prices toward a slowly drifting fair value. Everything is kept in this
-// browser (localStorage); the field and the markets are in data.js.
-import { EVENT, TEAMS, MARKETS, START_CASH } from './data.js';
+// Resolved: play-money prediction markets on NPDI, shared by everyone. The market lives on the server (worker/):
+// this page reads it from /api/state every few seconds and sends trades to /api/trade; you sign in with Google to
+// trade. The maths (market.js) is the same on both sides, so the ticket can preview a trade before it's sent.
+import { EVENT, START_CASH } from './data.js';
+import { M, byId, prices as P, priceOf as PO, moved as MV, costOf as CO, sharesFor as SF, worth as W, softmax } from './market.js';
 
 const $ = id => document.getElementById(id);
-const KEY = 'resolved-v1';
-const MIN = 6e4, HOUR = 36e5, DAY = 864e5;
+const DAY = 864e5, POLL = 5000;
 const RANGE = { '1d': DAY, '1w': 7 * DAY, '1m': 30 * DAY };
 const SLOTS = ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)'];
 const BADGE = ['#132047', '#2a6f97', '#8a5a00', '#5b3f9e', '#1f7a54', '#9c3d63', '#40566b', '#a2471e', '#2d6a6a', '#6b4f2a'];
 const TROPHY = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h10v5a5 5 0 0 1-10 0zM7 6H4v1.5A3.5 3.5 0 0 0 7.5 11M17 6h3v1.5a3.5 3.5 0 0 1-3.5 3.5M12 14v4M8 20h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const G = $('signin').querySelector('svg').outerHTML;
 const mobile = () => matchMedia('(max-width:920px)').matches;
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -19,103 +19,63 @@ const whole = x => '$' + Math.round(x).toLocaleString('en-US');
 const cents = p => { const c = p * 100; return c < 1 ? '<1¢' : c > 99 ? '>99¢' : Math.round(c) + '¢'; };
 const pct = p => { const c = p * 100; return c < 1 ? '<1%' : c > 99 ? '>99%' : Math.round(c) + '%'; };
 const ago = t => { const s = (Date.now() - t) / 1000; return s < 60 ? 'just now' : s < 3600 ? Math.floor(s / 60) + 'm ago' : s < 86400 ? Math.floor(s / 3600) + 'h ago' : Math.floor(s / 86400) + 'd ago'; };
-const ARROW = { up: '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M5 1 9.5 8h-9z" fill="currentColor"/></svg>', down: '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M5 9 .5 2h9z" fill="currentColor"/></svg>' };
-
-// seeded randomness, so the made-up price history is the same for everyone
-function rng(seed) { let a = seed >>> 0; return () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 const hash = s => { let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return h >>> 0; };
-const gauss = r => Math.sqrt(-2 * Math.log(r() || 1e-9)) * Math.cos(2 * Math.PI * r());
-const softmax = z => { const mx = Math.max(...z), e = z.map(x => Math.exp(x - mx)), s = e.reduce((a, b) => a + b, 0); return e.map(x => x / s); };
+const signed = (x, f = money) => (x >= 0 ? '+' : '') + f(x);
+const tone = x => x > .005 ? 'up' : x < -.005 ? 'down' : '';
+const ARROW = { up: '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M5 1 9.5 8h-9z" fill="currentColor"/></svg>', down: '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M5 9 .5 2h9z" fill="currentColor"/></svg>' };
+const loginUrl = () => '/auth/login?next=' + encodeURIComponent('/#' + V.m.id);
 
-/* ---------- the markets ---------- */
-const M = MARKETS.map(d => {
-  const outs = d.kind === 'multi'
-    ? TEAMS.map(t => ({ id: t.id, name: `${t.school} ${t.team}`, school: t.school, team: t.team }))
-    : [{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }];
-  const raw = d.kind === 'multi' ? TEAMS.map(t => Math.max(.2, +t[d.key] || 1)) : [d.p, 100 - d.p];
-  const sum = raw.reduce((a, b) => a + b, 0);
-  const p0 = raw.map(x => x / sum);
-  return { ...d, outs, p0, sig: outs.map(o => o.id).join(','), fair: p0.map(Math.log) };
-});
-const byId = Object.fromEntries(M.map(m => [m.id, m]));
+/* ---------- the shared market, as last read from the server ---------- */
+const S = { v: null, mk: {}, feed: [], board: null, me: null, lastT: 0, ready: false };
+const prices = m => P(S.mk[m.id].q, m.b);
+const priceOf = (m, o, side) => PO(S.mk[m.id].q, m.b, o, side);
+const moved = (m, o, side, n) => MV(S.mk[m.id].q, o, side, n);
+const costOf = (m, o, side, n) => CO(S.mk[m.id].q, m.b, o, side, n);
+const sharesFor = (m, o, side, usd) => SF(S.mk[m.id].q, m.b, o, side, usd);
+const worth = p => W(S.mk[p.m].q, byId[p.m].b, p.o, p.side, p.n);
+const cash = () => S.me ? S.me.cash : 0;
+const posOf = (m, o, side) => S.me?.pos.find(p => p.m === m.id && p.o === o && p.side === side);
+const held = (m, o, side) => posOf(m, o, side)?.n || 0;
 
-const lse = (q, b) => { const mx = Math.max(...q) / b; let s = 0; for (const x of q) s += Math.exp(x / b - mx); return b * (mx + Math.log(s)); };
-const prices = m => softmax(S.mk[m.id].q.map(x => x / m.b));
-const priceOf = (m, o, side) => { const p = prices(m)[o]; return side === 'yes' ? p : 1 - p; };
-// "Yes" on outcome o adds n shares of o; "No" adds n shares of every other outcome (pays $1 unless o wins)
-const moved = (m, o, side, n) => S.mk[m.id].q.map((x, j) => x + ((side === 'yes') === (j === o) ? n : 0));
-const costOf = (m, o, side, n) => lse(moved(m, o, side, n), m.b) - lse(S.mk[m.id].q, m.b);
-function sharesFor(m, o, side, usd) {
-  let lo = 0, hi = usd / Math.max(priceOf(m, o, side), 1e-4) + 1;
-  for (let i = 0; i < 60; i++) { const mid = (lo + hi) / 2; if (costOf(m, o, side, mid) > usd) hi = mid; else lo = mid; }
-  return lo;
-}
-function apply(m, o, side, n) { S.mk[m.id].q = moved(m, o, side, n); record(m); }
-
-/* ---------- saved state ---------- */
-let S = null;
-try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.v === 1) S = s; } catch (e) { /* private mode: start fresh */ }
-let saveT = 0;
-function save(now) {
-  clearTimeout(saveT);
-  const go = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage full or blocked */ } };
-  if (now) go(); else saveT = setTimeout(go, 800);
-}
-function fresh() {
-  S = { v: 1, cash: START_CASH, pos: {}, feed: [], mk: {} };
-}
-if (!S) fresh();
-for (const m of M) {
-  const k = S.mk[m.id];
-  if (k && k.sig === m.sig) continue;
-  // new market, or its teams changed: start it over (and refund anything held in it)
-  for (const [key, p] of Object.entries(S.pos)) if (p.m === m.id) { S.cash += p.cost; delete S.pos[key]; }
-  S.mk[m.id] = { sig: m.sig, q: m.p0.map(p => m.b * Math.log(p)), vol: m.vol, ...pastPrices(m) };
-}
-if (!S.feed.length) seedFeed();
-
-// a made-up past: random walks in log-odds, run backwards from today's prices, with a few jumps (earlier
-// tournaments). Dense near now, sparse further back.
-function pastPrices(m) {
-  const r = rng(hash(m.id + m.sig)), now = Date.now(), ts = [];
-  for (let t = now; t > now - DAY; t -= 10 * MIN) ts.push(t);
-  for (let t = now - DAY; t > now - 7 * DAY; t -= HOUR) ts.push(t);
-  for (let t = now - 7 * DAY; t > now - 30 * DAY; t -= 6 * HOUR) ts.push(t);
-  for (let t = now - 30 * DAY; t >= now - 90 * DAY; t -= DAY) ts.push(t);
-  const jumps = [0, 1, 2].map(() => now - (8 + r() * 75) * DAY);
-  let z = m.p0.map(Math.log);
-  const ps = [];
-  for (let i = 0; i < ts.length; i++) {
-    ps.push(softmax(z).map(x => +x.toFixed(4)));
-    if (i + 1 === ts.length) break;
-    const dt = (ts[i] - ts[i + 1]) / DAY;
-    const jump = jumps.some(j => j <= ts[i] && j > ts[i + 1]);
-    z = z.map((x, j) => x + gauss(r) * .075 * Math.sqrt(dt) * (m.kind === 'binary' && j ? 0 : 1) + (jump ? gauss(r) * .28 : 0));
+function take(st) {
+  if ('me' in st) S.me = st.me;
+  if (st.same) return false;
+  for (const m of M) {
+    const k = S.mk[m.id] || (S.mk[m.id] = { t: [], p: [] }), src = st.markets[m.id];
+    k.q = src.q; k.vol = src.vol;
+    for (const [t, p] of st.hist[m.id] || []) {
+      if (k.t.length && t <= k.t[k.t.length - 1]) continue;
+      k.t.push(t); k.p.push(p); S.lastT = Math.max(S.lastT, t);
+    }
   }
-  return { t: ts.reverse(), p: ps.reverse() };
+  S.feed = st.feed; S.board = st.board; S.v = st.v;
+  return true;
 }
-function record(m) {
-  const h = S.mk[m.id], now = Date.now(), p = prices(m).map(x => +x.toFixed(4));
-  if (now - h.t[h.t.length - 1] < 30e3 && h.t.length > 1) { h.t[h.t.length - 1] = now; h.p[h.p.length - 1] = p; } else { h.t.push(now); h.p.push(p); }
-  if (h.t.length > 1600) { // thin out the older half
-    const cut = h.t.length >> 1, t = [], ps = [];
-    for (let i = 0; i < h.t.length; i++) if (i >= cut || i % 2 === 0) { t.push(h.t[i]); ps.push(h.p[i]); }
-    h.t = t; h.p = ps;
+let pollT = 0, fails = 0, busy = false;
+async function poll() {
+  clearTimeout(pollT);
+  if (busy) { pollT = setTimeout(poll, POLL); return; }
+  try {
+    const r = await fetch(`/api/state?since=${S.lastT}&v=${S.v ?? ''}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    const st = await r.json();
+    const meBefore = JSON.stringify(S.me), changed = take(st);
+    fails = 0;
+    if (!S.ready) { S.ready = true; start(); }
+    else if (changed) refresh();
+    else if (JSON.stringify(S.me) !== meBefore) { renderAccount(); renderPositions(); updateTicket(); }
+  } catch (e) {
+    fails++;
+    if (!S.ready) $('contracts').innerHTML = `<p class="empty">Couldn’t reach the market. Trying again…</p>`;
   }
+  pollT = setTimeout(poll, document.hidden ? POLL * 6 : Math.min(POLL * 2 ** Math.max(0, fails - 1), 60e3));
 }
-function seedFeed() {
-  const r = rng(hash('feed')), now = Date.now();
-  for (let i = 0; i < 14; i++) {
-    const m = pickMarket(r), o = m.kind === 'multi' ? pickOutcome(m, r) : 0;
-    const side = r() < .6 ? 'yes' : 'no', usd = Math.round(Math.exp(Math.log(18) + gauss(r) * .8));
-    S.feed.push({ t: now - (i + r()) * 2.3 * MIN, m: m.id, o, side, usd: Math.max(2, usd), px: priceOf(m, o, side) });
-  }
-}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.ready) poll(); });
 
 /* ---------- view state ---------- */
 const V = {
   m: byId[location.hash.slice(1)] || M[0],
-  range: 'all', sort: 'chance', all: false, tab: 'pos',
+  range: 'all', sort: 'chance', all: false,
   sel: {},          // per market: the selected outcome
   set: {},          // per market: the teams charted (fixed for the visit, so colours stay put)
   shown: {},        // last prices shown, for the flashes
@@ -133,6 +93,7 @@ function chartSet(m) {
 }
 function priceAt(m, t) {
   const h = S.mk[m.id]; let lo = 0, hi = h.t.length - 1;
+  if (!h.t.length) return prices(m);
   if (t <= h.t[0]) return h.p[0];
   while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (h.t[mid] <= t) lo = mid; else hi = mid - 1; }
   return h.p[lo];
@@ -151,6 +112,27 @@ function badge(m, o) {
 }
 const label = (m, o) => m.kind === 'multi' ? m.outs[o].name : m.short;
 
+/* ---------- your account ---------- */
+function renderAccount() {
+  const me = S.me;
+  $('bal').hidden = !me; $('signin').hidden = !!me;
+  $('signin').href = loginUrl();
+  if (!me) { $('menu').hidden = true; return; }
+  $('avatar').textContent = (me.name || '?')[0].toUpperCase();
+  $('avatar').setAttribute('aria-label', `Account: ${me.name}`);
+  $('menu-name').textContent = me.name;
+  $('menu-email').textContent = me.email;
+  $('port-val').textContent = money(positionsValue());
+  $('cash').textContent = money(me.cash);
+}
+$('avatar').onclick = e => { e.stopPropagation(); const open = $('menu').hidden; $('menu').hidden = !open; $('avatar').setAttribute('aria-expanded', open); };
+addEventListener('click', e => { if (!$('menu').hidden && !e.target.closest('#menu')) { $('menu').hidden = true; $('avatar').setAttribute('aria-expanded', 'false'); } });
+$('sign-out').onclick = async () => {
+  await fetch('/auth/logout', { method: 'POST' }).catch(() => {});
+  S.me = null; $('menu').hidden = true; renderAccount(); renderPositions(); renderTicket(); renderBoard(); renderFeed();
+  toast('Signed out');
+};
+
 /* ---------- the market chips ---------- */
 function renderChips() {
   $('mkts').innerHTML = M.map(m => `<button type="button" class="mkt" data-m="${m.id}" aria-pressed="${m === V.m}">${esc(m.short)} <em></em></button>`).join('');
@@ -163,13 +145,13 @@ function updateChips() {
     b.querySelector('em').textContent = m.kind === 'multi' ? `${m.outs[i].name} ${pct(p[i])}` : pct(p[0]);
   }
 }
-$('mkts').addEventListener('click', e => { const b = e.target.closest('.mkt'); if (b) go(byId[b.dataset.m]); });
+$('mkts').addEventListener('click', e => { const b = e.target.closest('.mkt'); if (b && S.ready) go(byId[b.dataset.m]); });
 
 function go(m) {
   V.m = m; V.all = false;
   history.replaceState(null, '', '#' + m.id);
   T.mode = 'buy'; T.side = 'yes';
-  renderMarket();
+  renderMarket(); renderAccount();
   for (const b of $('mkts').children) b.setAttribute('aria-pressed', b.dataset.m === m.id);
 }
 
@@ -178,7 +160,6 @@ function renderMarket() {
   const m = cur();
   $('m-kick').textContent = `${EVENT.short} ${EVENT.year} · ${m.short}`;
   $('m-title').textContent = m.title;
-  $('ev-name').textContent = `${EVENT.short} ${EVENT.year}`;
   $('hero').hidden = m.kind !== 'binary';
   $('m-ic').innerHTML = m.kind === 'binary' ? '?' : m.id === 'topseed' ? '#1' : TROPHY;
   renderContracts();
@@ -241,6 +222,7 @@ function updateMarket() {
   if (!V.hover) legend();
 }
 $('contracts').addEventListener('click', e => {
+  if (!S.ready) return;
   const m = cur(), t = e.target;
   const s = t.closest('[data-sort]'); if (s) { V.sort = s.dataset.sort; renderContracts(); updateMarket(); return; }
   if (t.closest('[data-more]')) { V.all = !V.all; renderContracts(); updateMarket(); return; }
@@ -260,10 +242,11 @@ function pick(m, o, side, open) {
 let CH = null;
 function drawChart() {
   const m = cur(), box = $('chart'), W = box.clientWidth, H = box.clientHeight;
-  if (!W) return;
+  if (!W || !S.ready) return;
   const padR = 42, padT = 8, padB = 22, pw = W - padR, ph = H - padT - padB;
   const h = S.mk[m.id], now = Date.now();
-  const start = V.range === 'all' ? h.t[0] : Math.max(h.t[0], now - RANGE[V.range]);
+  let start = V.range === 'all' ? h.t[0] : Math.max(h.t[0], now - RANGE[V.range]);
+  if (!(now - start > 60e3)) start = now - 60e3;
   let i0 = 0; while (i0 < h.t.length - 1 && h.t[i0 + 1] <= start) i0++;
   const ts = h.t.slice(i0), ps = h.p.slice(i0);
   ts.push(now); ps.push(prices(m));
@@ -276,16 +259,21 @@ function drawChart() {
   const Y = v => padT + ph - v / ymax * ph;
   let g = '';
   for (let v = 0; v <= ymax + 1e-9; v += step) g += `<line class="gl" x1="0" x2="${pw}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/><text class="yl" x="${pw + 8}" y="${(Y(v) + 4).toFixed(1)}">${Math.round(v * 100)}%</text>`;
-  const fmtX = t => V.range === '1d' ? new Date(t).toLocaleTimeString('en-US', { hour: 'numeric' }) : new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const span = now - start;
+  const fmtX = t => span <= 2 * DAY ? new Date(t).toLocaleTimeString('en-US', span < 6 * 36e5 ? { hour: 'numeric', minute: '2-digit' } : { hour: 'numeric' }) : new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   const nx = Math.max(2, Math.min(5, Math.floor(pw / 110)));
   for (let i = 0; i <= nx; i++) {
-    const t = start + (now - start) * i / nx, x = X(t);
+    const t = start + span * i / nx, x = X(t);
     g += `<text class="xl" x="${x.toFixed(1)}" y="${H - 4}" text-anchor="${i === 0 ? 'start' : i === nx ? 'end' : 'middle'}">${fmtX(t)}</text>`;
   }
   const sel = outIdx(m);
   const lines = set.slice().sort((a, b) => (a.o === sel) - (b.o === sel)).map(s => {
+    // steps: a price holds until the next trade moves it
     let d = '';
-    for (let i = 0; i < ts.length; i++) d += (i ? 'L' : 'M') + X(ts[i]).toFixed(1) + ' ' + Y(ps[i][s.o]).toFixed(1);
+    for (let i = 0; i < ts.length; i++) {
+      const x = X(ts[i]).toFixed(1), y = Y(ps[i][s.o]).toFixed(1);
+      d += i ? `H${x}V${y}` : `M${x} ${y}`;
+    }
     const last = ps[ps.length - 1][s.o];
     return `<path class="ln" d="${d}" stroke="${SLOTS[s.slot]}"/><circle class="dot" r="4" cx="${pw.toFixed(1)}" cy="${Y(last).toFixed(1)}" fill="${SLOTS[s.slot]}"/>`;
   }).join('');
@@ -297,6 +285,7 @@ function drawChart() {
   if (V.hover) hoverAt(V.hover); else legend();
 }
 function legend(i) {
+  if (!S.ready) return;
   const m = cur(), set = chartSet(m);
   const p = i == null ? prices(m) : CH.ps[i];
   const when = i == null ? '' : new Date(CH.ts[i]).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
@@ -307,14 +296,13 @@ function hoverAt(clientX) {
   const r = $('chart').getBoundingClientRect(), x = clientX - r.left;
   if (x < 0 || x > CH.pw + 2) { unhover(); return; }
   const t = CH.start + x / CH.pw * (CH.now - CH.start);
-  let lo = 0, hi = CH.ts.length - 1;
-  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (CH.ts[mid] < t) lo = mid; else hi = mid; }
-  const i = Math.abs(CH.ts[lo] - t) < Math.abs(CH.ts[hi] - t) ? lo : hi;
-  const hx = CH.X(CH.ts[i]);
+  // the price at that moment: the last point at or before it
+  let i = 0; while (i < CH.ts.length - 1 && CH.ts[i + 1] <= t) i++;
+  const hx = Math.max(0, Math.min(CH.pw, x));
   $('hov').innerHTML = `<line class="hair" x1="${hx}" x2="${hx}" y1="${CH.padT}" y2="${CH.padT + CH.ph}"/>`
     + CH.set.map(s => `<circle class="dot" r="4.5" cx="${hx}" cy="${CH.Y(CH.ps[i][s.o])}" fill="${SLOTS[s.slot]}"/>`).join('');
   const m = CH.m, tip = $('tip');
-  tip.innerHTML = `<div class="t">${new Date(CH.ts[i]).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</div>`
+  tip.innerHTML = `<div class="t">${new Date(t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</div>`
     + CH.set.slice().sort((a, b) => CH.ps[i][b.o] - CH.ps[i][a.o]).map(s => `<div class="r"><i style="background:${SLOTS[s.slot]}"></i>${esc(m.kind === 'binary' ? 'Yes' : label(m, s.o))}<b>${pct(CH.ps[i][s.o])}</b></div>`).join('');
   const tw = tip.offsetWidth;
   tip.style.transform = `translate(${hx + 14 + tw > CH.pw ? hx - 14 - tw : hx + 14}px, 6px)`;
@@ -330,37 +318,48 @@ $('ranges').addEventListener('click', e => { const b = e.target.closest('[data-r
 new ResizeObserver(() => drawChart()).observe($('chart'));
 
 /* ---------- the ticket ---------- */
-const posKey = (m, o, side) => `${m.id}|${o}|${side}`;
-const held = (m, o, side) => S.pos[posKey(m, o, side)]?.n || 0;
 function renderTicket() {
-  const m = cur(), o = outIdx(m), bd = badge(m, o);
+  if (!S.ready) return;
+  const m = cur(), o = outIdx(m), bd = badge(m, o), buy = T.mode === 'buy';
   $('tk-badge').style.background = bd.bg;
   $('tk-badge').textContent = bd.txt;
   $('tk-mkt').textContent = m.kind === 'multi' ? m.title : `${EVENT.short} ${EVENT.year}`;
   $('tk-name').textContent = m.kind === 'multi' ? m.outs[o].name : m.title;
-  $('tk-buy').setAttribute('aria-selected', T.mode === 'buy');
-  $('tk-sell').setAttribute('aria-selected', T.mode === 'sell');
-  const buy = T.mode === 'buy';
+  $('tk-buy').setAttribute('aria-selected', buy);
+  $('tk-sell').setAttribute('aria-selected', !buy);
   $('tk-lbl').textContent = buy ? 'Amount' : 'Shares';
   $('tk-unit').textContent = buy ? '$' : '#';
   $('tk-amt').step = buy ? '1' : 'any';
-  $('tk-quick').innerHTML = (buy ? ['+$1', '+$10', '+$50', 'Max'] : ['25%', '50%', '75%', 'All']).map(q => `<button type="button" data-q="${q}">${q}</button>`).join('');
+  $('tk-amt').disabled = !S.me;
+  $('tk-amt').closest('.field').hidden = !S.me;
+  $('tk-quick').innerHTML = S.me ? (buy ? ['+$1', '+$10', '+$50', 'Max'] : ['25%', '50%', '75%', 'All']).map(q => `<button type="button" data-q="${q}">${q}</button>`).join('') : '';
+  $('tk-fine').textContent = S.me ? 'Play money. Nothing here is real.' : `Everyone starts with ${whole(START_CASH)} of play money.`;
   updateTicket();
 }
 function updateTicket() {
+  if (!S.ready) return;
   const m = cur(), o = outIdx(m), side = T.side, buy = T.mode === 'buy';
   const p = priceOf(m, o, side), amt = parseFloat($('tk-amt').value) || 0, have = held(m, o, side);
   $('tk-yp').textContent = cents(priceOf(m, o, 'yes'));
   $('tk-np').textContent = cents(priceOf(m, o, 'no'));
   $('tk-y').classList.toggle('on', side === 'yes');
   $('tk-n').classList.toggle('on', side === 'no');
-  $('tk-have').textContent = buy ? `Cash ${money(S.cash)}` : `You have ${have.toFixed(2)}`;
+  $('tk-have').textContent = !S.me ? '' : buy ? `Cash ${money(cash())}` : `You have ${have.toFixed(2)}`;
   const S_ = side === 'yes' ? 'Yes' : 'No', go = $('tk-go');
   go.classList.toggle('n', side === 'no');
+  go.classList.toggle('in', !S.me);
+  if (!S.me) {
+    $('tk-est').innerHTML = `<div><dt>Price</dt><span>${cents(p)}</span></div><div><dt>Pays if right</dt><span>$1.00 a share</span></div>`;
+    $('tk-warn').textContent = '';
+    go.innerHTML = `${G}Sign in with Google to trade`;
+    go.disabled = false;
+    return;
+  }
   let warn = '', est = '', ok = false;
   if (buy) {
-    if (amt > S.cash + 1e-9) warn = 'Not enough cash.';
-    const usd = Math.min(amt, S.cash);
+    if (amt > cash() + 1e-9) warn = 'Not enough cash.';
+    else if (amt > 0 && amt < 1) warn = 'The smallest trade is $1.';
+    const usd = Math.min(amt, cash());
     const n = usd > 0 ? sharesFor(m, o, side, usd) : 0;
     const after = n ? softmax(moved(m, o, side, n).map(x => x / m.b))[o] : null;
     const pa = after == null ? p : side === 'yes' ? after : 1 - after;
@@ -368,10 +367,10 @@ function updateTicket() {
       + `<div><dt>Shares</dt><span>${n.toFixed(2)}</span></div>`
       + `<div><dt>Price moves</dt><span>${cents(p)} → ${cents(pa)}</span></div>`
       + `<div class="win ${side === 'no' ? 'n' : ''}"><dt>Payout if ${S_}</dt><span style="text-align:right"><b>${money(n)}</b>${n ? `<small>+${money(n - usd)} (${Math.round((n / usd - 1) * 100)}%)</small>` : ''}</span></div>`;
-    ok = amt > 0 && !warn;
-    go.textContent = amt > 0 ? `Buy ${S_} · ${money(Math.min(amt, S.cash))}` : `Buy ${S_}`;
+    ok = amt >= 1 && !warn;
+    go.textContent = amt > 0 ? `Buy ${S_} · ${money(Math.min(amt, cash()))}` : `Buy ${S_}`;
   } else {
-    const pos = S.pos[posKey(m, o, side)];
+    const pos = posOf(m, o, side);
     if (!have) warn = `You don’t hold any ${S_} shares here.`;
     else if (amt > have + 1e-3) warn = `You only have ${have.toFixed(2)}.`;
     const n = amt >= have - 1e-3 ? have : amt;
@@ -385,7 +384,8 @@ function updateTicket() {
   }
   $('tk-est').innerHTML = est;
   $('tk-warn').textContent = warn;
-  go.disabled = !ok;
+  go.disabled = !ok || busy;
+  if (busy) go.textContent = 'Placing order…';
 }
 $('tk-y').onclick = () => { T.side = 'yes'; updateTicket(); updateMarket(); };
 $('tk-n').onclick = () => { T.side = 'no'; updateTicket(); updateMarket(); };
@@ -395,105 +395,101 @@ $('tk-amt').addEventListener('input', updateTicket);
 $('tk-amt').addEventListener('keydown', e => { if (e.key === 'Enter' && !$('tk-go').disabled) trade(); });
 $('tk-quick').addEventListener('click', e => {
   const b = e.target.closest('[data-q]'); if (!b) return;
-  const q = b.dataset.q, m = cur(), have = held(m, outIdx(m), T.side), v = parseFloat($('tk-amt').value) || 0;
-  if (T.mode === 'buy') $('tk-amt').value = q === 'Max' ? Math.floor(S.cash * 100) / 100 : Math.min(Math.floor(S.cash * 100) / 100, v + parseFloat(q.slice(2)));
+  const q = b.dataset.q, m = cur(), have = held(m, outIdx(m), T.side), v = parseFloat($('tk-amt').value) || 0, c = Math.floor(cash() * 100) / 100;
+  if (T.mode === 'buy') $('tk-amt').value = q === 'Max' ? c : Math.min(c, v + parseFloat(q.slice(2)));
   else $('tk-amt').value = q === 'All' ? +have.toFixed(4) : +(have * parseFloat(q) / 100).toFixed(2);
   updateTicket();
 });
-$('tk-go').onclick = trade;
+$('tk-go').onclick = () => { if (!S.me) location.href = loginUrl(); else trade(); };
 
-function trade() {
-  const m = cur(), o = outIdx(m), side = T.side, amt = parseFloat($('tk-amt').value) || 0;
-  const key = posKey(m, o, side), S_ = side === 'yes' ? 'Yes' : 'No', name = label(m, o);
-  if (T.mode === 'buy') {
-    const usd = Math.min(amt, S.cash); if (usd <= 0) return;
-    const n = sharesFor(m, o, side, usd), cost = costOf(m, o, side, n);
-    apply(m, o, side, n);
-    S.cash = Math.max(0, S.cash - cost);
-    const p = S.pos[key] || (S.pos[key] = { m: m.id, o, side, n: 0, cost: 0 });
-    p.n += n; p.cost += cost;
-    log({ m: m.id, o, side, usd: cost, px: cost / n, mine: true });
-    S.mk[m.id].vol += cost;
-    toast(`Bought ${n.toFixed(1)} ${S_} · ${name} at ${(cost / n * 100).toFixed(1)}¢`);
-  } else {
-    const p = S.pos[key]; if (!p) return;
-    const n = amt >= p.n - 1e-3 ? p.n : amt; if (n <= 0) return;
-    const get = -costOf(m, o, side, -n);
-    apply(m, o, side, -n);
-    S.cash += get;
-    p.cost -= p.cost * n / p.n; p.n -= n;
-    if (p.n < 1e-6) { delete S.pos[key]; T.mode = 'buy'; }
-    log({ m: m.id, o, side, usd: get, px: get / n, mine: true, sell: true });
-    S.mk[m.id].vol += get;
-    toast(`Sold ${n.toFixed(1)} ${S_} · ${name} for ${money(get)}`);
+async function trade() {
+  if (busy) return;
+  const m = cur(), o = outIdx(m), side = T.side, buy = T.mode === 'buy', amt = parseFloat($('tk-amt').value) || 0;
+  const S_ = side === 'yes' ? 'Yes' : 'No', name = label(m, o);
+  const body = { m: m.id, o, side, mode: T.mode, amount: amt, since: S.lastT };
+  // what the ticket promised, less 3%: if other trades moved the price further than that, the order is refused
+  if (buy) body.minShares = sharesFor(m, o, side, Math.min(amt, cash())) * .97;
+  else { const have = held(m, o, side), n = amt >= have - 1e-3 ? have : amt; body.minReturn = -costOf(m, o, side, -n) * .97; }
+  busy = true; updateTicket();
+  try {
+    const r = await fetch('/api/trade', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const res = await r.json().catch(() => ({ error: 'Something went wrong. Try again.' }));
+    busy = false;
+    if (!r.ok) {
+      if (r.status === 401) S.me = null;
+      toast(res.error || 'That didn’t go through. Try again.');
+      poll(); renderAccount(); renderTicket();
+      return;
+    }
+    take(res.state);
+    $('tk-amt').value = '';
+    if (!buy && !held(m, o, side)) T.mode = 'buy';
+    toast(buy ? `Bought ${res.n.toFixed(1)} ${S_} · ${name} at ${(res.usd / res.n * 100).toFixed(1)}¢` : `Sold ${res.n.toFixed(1)} ${S_} · ${name} for ${money(res.usd)}`);
+    refresh(); renderTicket();
+    if (mobile()) setTimeout(closeTicket, 500);
+  } catch (e) {
+    busy = false; updateTicket();
+    toast('Couldn’t reach the market. Check your connection.');
   }
-  $('tk-amt').value = '';
-  save(true);
-  refresh();
-  renderTicket();
-  if (mobile()) setTimeout(closeTicket, 500);
 }
 
 /* the ticket as a sheet on phones */
-function openTicket() { $('ticket').classList.add('open'); $('scrim').classList.add('on'); setTimeout(() => $('tk-amt').focus({ preventScroll: true }), 350); }
+function openTicket() { $('ticket').classList.add('open'); $('scrim').classList.add('on'); if (S.me) setTimeout(() => $('tk-amt').focus({ preventScroll: true }), 350); }
 function closeTicket() { $('ticket').classList.remove('open'); $('scrim').classList.remove('on'); }
 $('tk-close').onclick = closeTicket;
 $('scrim').onclick = closeTicket;
-addEventListener('keydown', e => { if (e.key === 'Escape') closeTicket(); });
+addEventListener('keydown', e => { if (e.key === 'Escape') { closeTicket(); $('menu').hidden = true; } });
 
-/* ---------- positions, activity, rules ---------- */
-function positionsValue() { let v = 0; for (const p of Object.values(S.pos)) v += p.n * priceOf(byId[p.m], p.o, p.side); return v; }
+/* ---------- positions, leaderboard, activity, rules ---------- */
+function positionsValue() { let v = 0; for (const p of S.me?.pos || []) v += worth(p); return v; }
+const signInBlock = msg => `<div class="cta"><p>${msg}</p><a class="signin" href="${loginUrl()}">${G}<span>Sign in with Google</span></a></div>`;
 function renderPositions() {
-  const list = Object.entries(S.pos);
+  const list = S.me?.pos || [];
   $('pos-n').textContent = list.length;
-  const val = positionsValue(), total = S.cash + val, pl = total - START_CASH;
-  let h = `<div class="sum"><div><small>Total</small><b>${money(total)}</b></div><div><small>Cash</small><b>${money(S.cash)}</b></div><div><small>In positions</small><b>${money(val)}</b></div><div><small>Profit</small><b class="pl ${pl > .005 ? 'up' : pl < -.005 ? 'down' : ''}">${pl >= 0 ? '+' : ''}${money(pl)}</b></div></div>`;
+  if (!S.me) { $('p-pos').innerHTML = signInBlock(`Sign in to trade. Everyone starts with ${whole(START_CASH)} of play money.`); return; }
+  const val = positionsValue(), total = S.me.cash + val, pl = total - START_CASH;
+  let h = `<div class="sum"><div><small>Total</small><b>${money(total)}</b></div><div><small>Cash</small><b>${money(S.me.cash)}</b></div><div><small>In positions</small><b>${money(val)}</b></div><div><small>Profit</small><b class="pl ${tone(pl)}">${signed(pl)}</b></div></div>`;
   if (!list.length) h += `<p class="empty">No positions yet. Pick a team and buy Yes or No.</p>`;
   else {
-    h += `<table><thead><tr><th>Contract</th><th>Shares</th><th class="hide-s">Avg → Now</th><th>Value</th><th class="hide-s">P&amp;L</th><th><span class="sr-only">Sell</span></th></tr></thead><tbody>`
-      + list.map(([key, p]) => {
-        const m = byId[p.m], now = priceOf(m, p.o, p.side), v = p.n * now, d = v - p.cost;
+    h += `<table><thead><tr><th>Contract</th><th>Shares</th><th class="hide-s">Avg → Now</th><th title="What selling now would pay">Value</th><th class="hide-s">P&amp;L</th><th><span class="sr-only">Sell</span></th></tr></thead><tbody>`
+      + list.map((p, i) => {
+        const m = byId[p.m], now = priceOf(m, p.o, p.side), v = worth(p), d = v - p.cost;
         return `<tr><td><span class="c">${esc(label(m, p.o))}</span> <span class="${p.side === 'yes' ? 'side-y' : 'side-n'}">${p.side === 'yes' ? 'Yes' : 'No'}</span><span class="s">${esc(m.kind === 'multi' ? m.short : m.title)}</span></td>`
           + `<td>${p.n.toFixed(1)}</td><td class="hide-s">${(p.cost / p.n * 100).toFixed(1)}¢ → ${cents(now)}</td><td>${money(v)}</td>`
-          + `<td class="hide-s pl ${d > .005 ? 'up' : d < -.005 ? 'down' : ''}">${d >= 0 ? '+' : ''}${money(d)}</td><td><button type="button" class="mini" data-sell="${esc(key)}">Sell</button></td></tr>`;
+          + `<td class="hide-s pl ${tone(d)}">${signed(d)}</td><td><button type="button" class="mini" data-sell="${i}">Sell</button></td></tr>`;
       }).join('') + '</tbody></table>';
   }
-  h += `<button type="button" class="reset" id="reset">Start over with ${whole(START_CASH)}</button>`;
   $('p-pos').innerHTML = h;
-  $('port-val').textContent = money(val);
-  $('cash').textContent = money(S.cash);
 }
 $('p-pos').addEventListener('click', e => {
-  const s = e.target.closest('[data-sell]');
-  if (s) {
-    const p = S.pos[s.dataset.sell]; if (!p) return;
-    const m = byId[p.m];
-    if (m !== V.m) go(m);
-    V.sel[m.id] = p.o; T.side = p.side; T.mode = 'sell';
-    drawChart(); updateMarket(); renderTicket();
-    $('tk-amt').value = +p.n.toFixed(4); updateTicket();
-    if (mobile()) openTicket(); else scrollTo({ top: 0, behavior: 'smooth' });
-    return;
-  }
-  if (e.target.closest('#reset') && confirm(`Reset your play money to ${whole(START_CASH)} and clear your positions?`)) {
-    const keep = S.mk; fresh(); S.mk = keep; seedFeed(); save(true); refresh(); renderTicket();
-  }
+  const s = e.target.closest('[data-sell]'); if (!s) return;
+  const p = S.me?.pos[+s.dataset.sell]; if (!p) return;
+  const m = byId[p.m];
+  if (m !== V.m) go(m);
+  V.sel[m.id] = p.o; T.side = p.side; T.mode = 'sell';
+  drawChart(); updateMarket(); renderTicket();
+  $('tk-amt').value = +p.n.toFixed(4); updateTicket();
+  if (mobile()) openTicket(); else scrollTo({ top: 0, behavior: 'smooth' });
 });
-function log(f) {
-  S.feed.unshift({ t: Date.now(), ...f });
-  if (S.feed.length > 60) S.feed.length = 60;
-  renderFeed(true);
+function renderBoard() {
+  const b = S.board; if (!b) return;
+  if (!b.top.length) { $('p-board').innerHTML = `<p class="empty">No players yet.</p>`; return; }
+  const row = r => `<tr class="${r.me ? 'board-me' : ''}"><td class="rank">${r.rank}</td><td style="text-align:left">${esc(r.name)}${r.me ? ' <span class="side-y">You</span>' : ''}</td><td>${money(r.total)}</td><td class="pl ${tone(r.total - START_CASH)}">${signed(r.total - START_CASH)}</td></tr>`;
+  const mine = b.me && !b.top.some(r => r.me) ? row({ rank: b.me.rank, name: S.me?.name || 'You', total: b.me.total, me: true }) : '';
+  $('p-board').innerHTML = `<table><thead><tr><th class="rank">#</th><th style="text-align:left">Player</th><th>Total</th><th>Profit</th></tr></thead><tbody>${b.top.map(row).join('')}${mine}</tbody></table>`
+    + `<p class="fine" style="margin-top:12px">${b.players} player${b.players === 1 ? '' : 's'} · cash plus what positions would sell for now</p>`;
 }
-function renderFeed(isNew) {
-  $('feed').innerHTML = S.feed.slice(0, 30).map((f, i) => {
+function renderFeed() {
+  if (!S.feed.length) { $('feed').innerHTML = `<li class="empty" style="display:block">No trades yet. Be the first.</li>`; return; }
+  $('feed').innerHTML = S.feed.map(f => {
     const m = byId[f.m]; if (!m || f.o >= m.outs.length) return '';
     const sd = f.side === 'yes' ? 'Yes' : 'No';
-    return `<li class="${f.mine ? 'mine' : ''} ${isNew && i === 0 ? 'new' : ''}"><span class="what">${f.sell ? 'Sold' : 'Bought'} <span class="${f.side === 'yes' ? 'side-y' : 'side-n'}">${sd}</span> · ${esc(m.kind === 'multi' ? label(m, f.o) : m.short)}</span><span class="usd">${money(f.usd)}</span><span class="meta">${esc(m.short)} · ${ago(f.t)}</span><span class="px">at ${cents(f.px)}</span></li>`;
+    return `<li class="${f.mine ? 'mine' : ''}"><span class="what">${f.mine ? '' : `<b>${esc(f.who)}</b> `}${f.sell ? 'sold' : 'bought'} <span class="${f.side === 'yes' ? 'side-y' : 'side-n'}">${sd}</span> · ${esc(m.kind === 'multi' ? label(m, f.o) : m.short)}</span><span class="usd">${money(f.usd)}</span><span class="meta">${m.kind === 'multi' ? esc(m.short) + ' · ' : ''}${ago(f.t)}</span><span class="px">at ${cents(f.px)}</span></li>`;
   }).join('');
 }
 function renderRules() {
   const m = cur();
-  $('p-rules').innerHTML = `<p>${esc(m.rules)}</p><dl><dt>Event</dt><dd>${esc(EVENT.name)} ${EVENT.year}</dd><dt>Contracts</dt><dd>${m.kind === 'multi' ? `${m.outs.length} teams, one Yes/No each` : 'One Yes/No question'}</dd><dt>Pays</dt><dd>$1 a share if right, nothing if wrong</dd><dt>Prices</dt><dd>Set by every trade; Yes and No always add up to $1</dd><dt>Money</dt><dd>Play money, kept in this browser</dd></dl>`;
+  $('p-rules').innerHTML = `<p>${esc(m.rules)}</p><dl><dt>Event</dt><dd>${esc(EVENT.name)} ${EVENT.year}</dd><dt>Contracts</dt><dd>${m.kind === 'multi' ? `${m.outs.length} teams, one Yes/No each` : 'One Yes/No question'}</dd><dt>Pays</dt><dd>$1 a share if right, nothing if wrong</dd><dt>Prices</dt><dd>Set by everyone’s trades; Yes and No always add up to $1</dd><dt>Money</dt><dd>Play money: ${whole(START_CASH)} for each Google account</dd></dl>`;
 }
 $('t-pos').parentElement.addEventListener('click', e => {
   const b = e.target.closest('[role="tab"]'); if (!b) return;
@@ -502,40 +498,23 @@ $('t-pos').parentElement.addEventListener('click', e => {
 $('bal-port').onclick = $('bal-cash').onclick = () => { $('t-pos').click(); $('p-pos').closest('.card').scrollIntoView({ behavior: 'smooth', block: 'start' }); };
 
 let toastT = 0;
-function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), 2600); }
+function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), 3000); }
 
-/* ---------- other traders (simulated) ---------- */
-function pickMarket(r) { const w = M.map(m => m.id === 'champion' ? 4 : m.kind === 'multi' ? 2 : 1), s = w.reduce((a, b) => a + b, 0); let x = r() * s; for (let i = 0; i < M.length; i++) if ((x -= w[i]) < 0) return M[i]; return M[0]; }
-function pickOutcome(m, r) { const w = m.p0.map(Math.sqrt), s = w.reduce((a, b) => a + b, 0); let x = r() * s; for (let i = 0; i < w.length; i++) if ((x -= w[i]) < 0) return i; return 0; }
-const R = Math.random;
-function simTrade() {
-  for (const m of M) m.fair = m.fair.map((x, j) => x + gauss(R) * .012 * (m.kind === 'binary' && j ? 0 : 1));
-  const m = pickMarket(R), o = m.kind === 'multi' ? pickOutcome(m, R) : 0;
-  const f = softmax(m.fair)[o], p = prices(m)[o];
-  const side = Math.log(f / p) + gauss(R) * .22 > 0 ? 'yes' : 'no';
-  const usd = Math.min(200, Math.max(2, Math.round(Math.exp(Math.log(16) + gauss(R) * .75))));
-  const n = sharesFor(m, o, side, usd);
-  if (!n) return;
-  apply(m, o, side, n);
-  S.mk[m.id].vol += usd;
-  log({ m: m.id, o, side, usd, px: usd / n });
-  save();
-  refresh(m);
+function refresh() {
+  updateChips(); updateMarket(); drawChart(); updateTicket();
+  renderAccount(); renderPositions(); renderBoard(); renderFeed();
 }
-function refresh(changed) {
-  updateChips();
-  if (!changed || changed === cur()) { updateMarket(); drawChart(); updateTicket(); }
-  renderPositions();
-}
-let simT = 0;
-function loop() { simT = setTimeout(() => { if (!document.hidden) simTrade(); loop(); }, 2200 + Math.random() * 2600); }
-setInterval(() => { if (!document.hidden) renderFeed(); }, 30e3);
+setInterval(() => { if (!document.hidden && S.ready) renderFeed(); }, 30e3);
 
 /* ---------- start ---------- */
-$('foot').textContent = `${EVENT.name} ${EVENT.year}. A sample field with play money: prices start from our guesses and move with every trade, yours and simulated traders’.`;
-renderChips();
-renderMarket();
-renderPositions();
-renderFeed();
-loop();
-addEventListener('hashchange', () => { const m = byId[location.hash.slice(1)]; if (m && m !== V.m) go(m); });
+$('ev-name').textContent = `${EVENT.short} ${EVENT.year}`;
+$('m-title').textContent = V.m.title;
+$('foot').textContent = `${EVENT.name} ${EVENT.year}. A sample field with play money: prices start from our guesses and move with everyone’s trades.`;
+$('contracts').innerHTML = `<p class="empty">Loading the market…</p>`;
+function start() {
+  renderChips(); renderMarket(); renderAccount(); renderPositions(); renderBoard(); renderFeed();
+}
+addEventListener('hashchange', () => { const m = byId[location.hash.slice(1)]; if (m && m !== V.m && S.ready) go(m); });
+// the page used to keep a private market in this browser: clear it
+try { localStorage.removeItem('resolved-v1'); } catch (e) { /* storage blocked */ }
+poll();
